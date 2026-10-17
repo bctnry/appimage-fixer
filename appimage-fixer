@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+#
+# appimage-fixer -- install an AppImage system-wide by unpacking it, repairing
+#                   the Chromium/Electron SUID sandbox helper, and emitting a
+#                   matching uninstall script for every installation.
+#
+# Why this exists: on many distributions a plain `./Foo.AppImage` fails with
+# "The SUID sandbox helper binary was found, but is not configured correctly".
+# The bundled chrome-sandbox must be owned by root and have its setuid bit set.
+# Extracting the AppImage into a stable directory and fixing that one file is a
+# clean, FUSE-free alternative to running the AppImage in place.
+#
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+PROG="${0##*/}"
+
+DEFAULT_PREFIX="/opt"
+DEFAULT_BIN_DIR="/usr/local/bin"
+DEFAULT_UNINSTALL_DIR="/usr/local/bin"
+DEFAULT_DESKTOP_DIR="/usr/share/applications"
+
+INSTALL_DIR=""
+APP_NAME=""
+BIN_DIR="$DEFAULT_BIN_DIR"
+UNINSTALL_DIR="$DEFAULT_UNINSTALL_DIR"
+DESKTOP_DIR="$DEFAULT_DESKTOP_DIR"
+
+MAKE_SYMLINK=1
+MAKE_DESKTOP=0
+MAKE_UNINSTALLER=1
+FORCE=0
+KEEP_TEMP=0
+DRY_RUN=0
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_BOLD=$'\033[1m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
+else
+    C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_DIM=""; C_RESET=""
+fi
+
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+info() { printf '%s==>%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+run()  {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s  would run:%s %s\n' "$C_DIM" "$C_RESET" "$*"
+    else
+        "$@"
+    fi
+}
+
+usage() {
+    cat <<EOF
+${C_BOLD}$PROG${C_RESET} -- unpack an AppImage into a system location, fix the
+                   chrome-sandbox setuid bit, and generate an uninstaller.
+
+Usage:
+  $PROG [options] <file.AppImage>
+
+Options:
+  -n, --name NAME          Application name used for the install directory,
+                           launcher and uninstaller. Default: derived from the
+                           AppImage file name with the .AppImage suffix removed.
+  -d, --dest DIR           Exact directory the AppImage is unpacked into.
+                           Default: ${DEFAULT_PREFIX}/<name>
+  -b, --bin-dir DIR        Where the launcher symlink is created.
+                           Default: ${DEFAULT_BIN_DIR}
+  -u, --uninstall-dir DIR  Where the per-install uninstaller is written.
+                           Default: ${DEFAULT_UNINSTALL_DIR}
+      --desktop-dir DIR    Directory for the .desktop file (with --desktop).
+                           Default: ${DEFAULT_DESKTOP_DIR}
+      --desktop            Also install a .desktop entry.
+      --no-symlink         Do not create the launcher symlink.
+      --no-uninstaller     Do not generate an uninstall script.
+  -f, --force              Replace an existing installation at the same path.
+  -k, --keep-temp          Keep the temporary extraction directory.
+      --dry-run            Show what would happen without changing anything.
+  -h, --help               Show this help.
+
+Notes:
+  * This script needs root, because chrome-sandbox must be owned by root and
+    carry the setuid bit for the sandbox to work. Re-run it with sudo.
+  * The generated uninstaller lives outside the install directory, so it can
+    remove the installation (and itself) safely.
+
+Examples:
+  sudo $PROG ~/Downloads/Foo-1.2.3.AppImage
+  sudo $PROG -d /opt/foo-stable --name foo ~/Downloads/Foo-1.2.3.AppImage
+  sudo $PROG --desktop ~/Downloads/Bar.AppImage
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--name)
+            [ $# -ge 2 ] || die "$1 requires an argument"
+            APP_NAME="$2"; shift 2 ;;
+        -d|--dest)
+            [ $# -ge 2 ] || die "$1 requires an argument"
+            INSTALL_DIR="$2"; shift 2 ;;
+        -b|--bin-dir)
+            [ $# -ge 2 ] || die "$1 requires an argument"
+            BIN_DIR="$2"; shift 2 ;;
+        -u|--uninstall-dir)
+            [ $# -ge 2 ] || die "$1 requires an argument"
+            UNINSTALL_DIR="$2"; shift 2 ;;
+        --desktop-dir)
+            [ $# -ge 2 ] || die "$1 requires an argument"
+            DESKTOP_DIR="$2"; shift 2 ;;
+        --desktop)          MAKE_DESKTOP=1; shift ;;
+        --no-symlink)       MAKE_SYMLINK=0; shift ;;
+        --no-uninstaller)   MAKE_UNINSTALLER=0; shift ;;
+        -f|--force)         FORCE=1; shift ;;
+        -k|--keep-temp)     KEEP_TEMP=1; shift ;;
+        --dry-run)          DRY_RUN=1; shift ;;
+        -h|--help)          usage; exit 0 ;;
+        --)                 shift; break ;;
+        -*)                 usage >&2; die "unknown option: $1" ;;
+        *)                  break ;;
+    esac
+done
+
+APPIMAGE="${1:-}"
+[ -n "$APPIMAGE" ] || { usage >&2; exit 1; }
+case "$APPIMAGE" in
+    -*) die "unknown option: $APPIMAGE" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Resolve paths / derive defaults
+# ---------------------------------------------------------------------------
+[ -e "$APPIMAGE" ] || die "no such file: $APPIMAGE"
+[ -f "$APPIMAGE" ] || die "not a regular file: $APPIMAGE"
+
+# Make paths absolute *before* we ever change directory.
+abspath() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *)  printf '%s/%s\n' "$PWD" "$1" ;;
+    esac
+}
+
+APPIMAGE="$(abspath "$APPIMAGE")"
+
+if [ -z "$APP_NAME" ]; then
+    base="${APPIMAGE##*/}"
+    case "$base" in
+        *.AppImage) APP_NAME="${base%.AppImage}" ;;
+        *.appimage) APP_NAME="${base%.appimage}" ;;
+        *.AppImage.zsync) APP_NAME="${base%.AppImage.zsync}" ;;
+        *) APP_NAME="$base" ;;
+    esac
+fi
+
+# Reject names that would escape the destination prefix or break the shell.
+[ -n "$APP_NAME" ] || die "could not derive an application name; pass --name"
+case "$APP_NAME" in
+    */*|.|..) die "invalid application name: $APP_NAME" ;;
+esac
+case "$APP_NAME" in
+    *[!A-Za-z0-9._+-]*) die "application name '$APP_NAME' contains unsupported characters; pass --name" ;;
+esac
+
+[ -n "$INSTALL_DIR" ] || INSTALL_DIR="$DEFAULT_PREFIX/$APP_NAME"
+INSTALL_DIR="$(abspath "$INSTALL_DIR")"
+INSTALL_DIR="${INSTALL_DIR%/}"
+[ -n "$INSTALL_DIR" ] || die "refusing to install into /"
+
+BIN_DIR="$(abspath "$BIN_DIR")"
+UNINSTALL_DIR="$(abspath "$UNINSTALL_DIR")"
+DESKTOP_DIR="$(abspath "$DESKTOP_DIR")"
+
+LAUNCHER="$BIN_DIR/$APP_NAME"
+UNINSTALLER="$UNINSTALL_DIR/uninstall-$APP_NAME"
+DESKTOP_FILE=""
+[ "$MAKE_DESKTOP" -eq 1 ] && DESKTOP_FILE="$DESKTOP_DIR/$APP_NAME.desktop"
+
+# The uninstaller must never delete an unrelated path.
+case "$INSTALL_DIR" in
+    /) die "refusing to install into /" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    die "must run as root (needed to set the chrome-sandbox setuid bit); try: sudo $PROG ..."
+fi
+
+if [ -e "$INSTALL_DIR" ]; then
+    if [ "$FORCE" -eq 1 ]; then
+        info "replacing existing installation at $INSTALL_DIR"
+    else
+        die "$INSTALL_DIR already exists; use --force to replace it, or --dest/--name to choose another location"
+    fi
+fi
+
+if [ -e "$UNINSTALLER" ] && [ "$MAKE_UNINSTALLER" -eq 1 ] && [ "$FORCE" -ne 1 ]; then
+    die "$UNINSTALLER already exists; use --force to overwrite it"
+fi
+
+if [ "$MAKE_SYMLINK" -eq 1 ] && [ -e "$LAUNCHER" ] && [ "$FORCE" -ne 1 ]; then
+    die "$LAUNCHER already exists; use --force to overwrite it"
+fi
+
+if [ ! -x "$APPIMAGE" ]; then
+    warn "$APPIMAGE is not executable; adding the execute bit"
+    run chmod +x -- "$APPIMAGE"
+fi
+
+if command -v findmnt >/dev/null 2>&1; then
+    if findmnt -no OPTIONS --target "$(dirname "$INSTALL_DIR")" 2>/dev/null | grep -q 'nosuid'; then
+        warn "$(dirname "$INSTALL_DIR") is mounted nosuid; the setuid chrome-sandbox will not take effect there"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Extract the AppImage
+# ---------------------------------------------------------------------------
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/appimage-fixer.XXXXXX")"
+cleanup() {
+    if [ "$KEEP_TEMP" -eq 1 ]; then
+        printf 'kept temporary directory: %s\n' "$TMP"
+    else
+        rm -rf -- "$TMP"
+    fi
+}
+trap cleanup EXIT
+
+info "unpacking $APPIMAGE"
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s  would run:%s (cd %s && %s --appimage-extract)\n' "$C_DIM" "$C_RESET" "$TMP" "$APPIMAGE"
+    SRC="$TMP/squashfs-root"
+    mkdir -p "$SRC"
+    : > "$SRC/AppRun"
+else
+    if ! ( cd "$TMP" && "$APPIMAGE" --appimage-extract >/dev/null ); then
+        die "failed to unpack the AppImage (does it support --appimage-extract?)"
+    fi
+    SRC="$TMP/squashfs-root"
+    [ -d "$SRC" ] || die "the AppImage did not produce a squashfs-root directory"
+fi
+
+# ---------------------------------------------------------------------------
+# Move everything into place
+# ---------------------------------------------------------------------------
+info "installing into $INSTALL_DIR"
+if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p -- "$(dirname "$INSTALL_DIR")"
+    if [ -e "$INSTALL_DIR" ]; then
+        rm -rf -- "$INSTALL_DIR"
+    fi
+    cp -a -- "$SRC" "$INSTALL_DIR"
+else
+    printf '%s  would run:%s cp -a %s %s\n' "$C_DIM" "$C_RESET" "$SRC" "$INSTALL_DIR"
+    mkdir -p -- "$INSTALL_DIR"
+fi
+
+# Normalize ownership so a root-owned tree cannot be tampered with by users.
+run chown -R root:root -- "$INSTALL_DIR"
+
+# Make sure the entry point stays executable.
+if [ -e "$INSTALL_DIR/AppRun" ]; then
+    run chmod +x -- "$INSTALL_DIR/AppRun"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix the Chromium/Electron SUID sandbox helper
+# ---------------------------------------------------------------------------
+sandboxes=()
+while IFS= read -r -d '' sb; do
+    sandboxes+=("$sb")
+done < <(find "$INSTALL_DIR" -type f -name 'chrome-sandbox' -print0)
+
+if [ "${#sandboxes[@]}" -eq 0 ]; then
+    info "no chrome-sandbox found; nothing to fix (this may not be an Electron app)"
+else
+    for sb in "${sandboxes[@]}"; do
+        info "fixing sandbox: ${sb#"$INSTALL_DIR"/}"
+        run chown root:root -- "$sb"
+        run chmod 4755 -- "$sb"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            mode="$(stat -c '%a %U:%G' -- "$sb" 2>/dev/null || true)"
+            case "$mode" in
+                4755\ root:root) : ;;
+                *) warn "expected '4755 root:root' but got '${mode:-unknown}' for $sb" ;;
+            esac
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Launcher symlink / desktop entry
+# ---------------------------------------------------------------------------
+if [ "$MAKE_SYMLINK" -eq 1 ]; then
+    run mkdir -p -- "$BIN_DIR"
+    info "creating launcher $LAUNCHER"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        ln -sfn -- "$INSTALL_DIR/AppRun" "$LAUNCHER"
+    else
+        printf '%s  would run:%s ln -sfn %s %s\n' "$C_DIM" "$C_RESET" "$INSTALL_DIR/AppRun" "$LAUNCHER"
+    fi
+fi
+
+if [ "$MAKE_DESKTOP" -eq 1 ]; then
+    icon=""
+    for candidate in "$INSTALL_DIR/.DirIcon" "$INSTALL_DIR/$APP_NAME.png" "$INSTALL_DIR/$APP_NAME.svg"; do
+        if [ -e "$candidate" ]; then icon="$candidate"; break; fi
+    done
+    if [ -z "$icon" ]; then
+        icon="$(find "$INSTALL_DIR" -maxdepth 3 -type f \( -name '*.png' -o -name '*.svg' \) -print -quit 2>/dev/null || true)"
+    fi
+
+    exec_cmd="$INSTALL_DIR/AppRun"
+    [ "$MAKE_SYMLINK" -eq 1 ] && exec_cmd="$LAUNCHER"
+
+    info "installing desktop entry $DESKTOP_FILE"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        mkdir -p -- "$DESKTOP_DIR"
+        {
+            printf '[Desktop Entry]\n'
+            printf 'Type=Application\n'
+            printf 'Name=%s\n' "$APP_NAME"
+            printf 'Exec=%s %%U\n' "$exec_cmd"
+            [ -n "$icon" ] && printf 'Icon=%s\n' "$icon"
+            printf 'Terminal=false\n'
+            printf 'Categories=Utility;\n'
+        } > "$DESKTOP_FILE"
+        chmod 644 -- "$DESKTOP_FILE"
+        command -v update-desktop-database >/dev/null 2>&1 && \
+            update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Generate the per-installation uninstaller
+# ---------------------------------------------------------------------------
+if [ "$MAKE_UNINSTALLER" -eq 1 ]; then
+    info "generating uninstaller $UNINSTALLER"
+
+    read -r -d '' template <<'TEMPLATE' || true
+#!/usr/bin/env bash
+#
+# Uninstaller for @APP_NAME@.
+# Generated by appimage-fixer on @DATE@. This script is self-contained.
+set -euo pipefail
+
+# Re-exec from a private copy so this script may delete itself afterwards.
+if [ -z "${APPIMAGE_FIXER_UNINSTALL_RUNNING:-}" ]; then
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/uninstall-@APP_NAME@.XXXXXX")"
+    cp -- "$0" "$_tmp"
+    chmod +x -- "$_tmp"
+    APPIMAGE_FIXER_UNINSTALL_RUNNING=1 \
+    APPIMAGE_FIXER_UNINSTALL_SELF="$0" \
+        exec bash "$_tmp" "$@"
+fi
+
+INSTALL_DIR='@INSTALL_DIR@'
+LAUNCHER='@LAUNCHER@'
+DESKTOP_FILE='@DESKTOP_FILE@'
+
+if [ "$(id -u)" -ne 0 ] && [ ! -w "$(dirname "$INSTALL_DIR")" ]; then
+    printf 'error: %s\n' "must run as root to uninstall @APP_NAME@" >&2
+    exit 1
+fi
+
+printf '==> removing %s\n' "$INSTALL_DIR"
+rm -rf -- "$INSTALL_DIR"
+
+if [ -n "$LAUNCHER" ]; then
+    printf '==> removing %s\n' "$LAUNCHER"
+    rm -f -- "$LAUNCHER"
+fi
+
+if [ -n "$DESKTOP_FILE" ]; then
+    printf '==> removing %s\n' "$DESKTOP_FILE"
+    rm -f -- "$DESKTOP_FILE"
+    command -v update-desktop-database >/dev/null 2>&1 && \
+        update-desktop-database "$(dirname "$DESKTOP_FILE")" >/dev/null 2>&1 || true
+fi
+
+# Remove this uninstaller (the running copy is the private temporary one).
+self="${APPIMAGE_FIXER_UNINSTALL_SELF:-$0}"
+if [ -f "$self" ]; then
+    rm -f -- "$self"
+fi
+
+printf '==> @APP_NAME@ uninstalled.\n'
+TEMPLATE
+
+    template="${template//@APP_NAME@/$APP_NAME}"
+    template="${template//@INSTALL_DIR@/$INSTALL_DIR}"
+    template="${template//@LAUNCHER@/$LAUNCHER}"
+    template="${template//@DESKTOP_FILE@/$DESKTOP_FILE}"
+    template="${template//@DATE@/$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"
+
+    if [ "$DRY_RUN" -eq 0 ]; then
+        mkdir -p -- "$UNINSTALL_DIR"
+        printf '%s\n' "$template" > "$UNINSTALLER"
+        chmod 755 -- "$UNINSTALLER"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+printf '\n'
+info "installed ${C_BOLD}$APP_NAME${C_RESET}"
+printf '    location : %s\n' "$INSTALL_DIR"
+[ "$MAKE_SYMLINK" -eq 1 ] && printf '    launcher : %s\n' "$LAUNCHER"
+[ "$MAKE_DESKTOP" -eq 1 ] && printf '    desktop  : %s\n' "$DESKTOP_FILE"
+[ "$MAKE_UNINSTALLER" -eq 1 ] && printf '    uninstall: sudo %s\n' "$UNINSTALLER"
+printf '\n'
+if [ "$DRY_RUN" -eq 1 ]; then
+    info "dry run complete; nothing was changed"
+else
+    info "done. Run '$APP_NAME' or the launcher path above to start it."
+fi
