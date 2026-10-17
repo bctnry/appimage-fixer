@@ -109,10 +109,13 @@ sudo appimage-fixer --force ~/Downloads/Obsidian-1.6.0.AppImage
 1. **Unpacks** the AppImage with `<file> --appimage-extract` inside a temporary
    directory created with `mktemp -d` (removed on exit unless `--keep-temp`).
    The `squashfs-root` it produces is moved to the install directory.
-2. **Sets ownership/permissions** on the installed tree (`root:root`), makes
-   `AppRun` executable, and fixes every `chrome-sandbox` found:
-   `chown root:root` + `chmod 4755` (setuid root). It warns on a `nosuid` mount
-   and verifies the resulting mode where possible.
+2. **Sets ownership/permissions**: the tree becomes `root:root`, directories are
+   made traversable and files world-readable (some AppImages ship the squashfs
+   root as `0700`, which `cp -a` would preserve and which makes the app
+   unrunnable for normal users), `AppRun` is made executable, and every
+   `chrome-sandbox` found is fixed with `chown root:root` + `chmod 4755` (setuid
+   root). It warns on a `nosuid` mount and verifies the resulting mode where
+   possible.
 3. **Generates an uninstall script** for that specific installation at
    `<uninstall-dir>/uninstall-<name>`. It records the exact install directory,
    launcher and desktop file, so it removes precisely what was installed, then
@@ -126,6 +129,30 @@ Each installation gets its own uninstaller, named after it:
 ```sh
 sudo /usr/local/bin/uninstall-obsidian
 ```
+
+## Troubleshooting
+
+**`zsh: permission denied: myapp`** right after installing.
+
+The launcher symlink is fine; the app directory (or something inside it) is not
+readable or executable by your user. This happens when the AppImage ships its
+squashfs root with a restrictive mode such as `0700`, which the installer used
+to preserve while unpacking. Check with:
+
+```sh
+ls -ld /opt/myapp
+```
+
+If it shows `drwx------`, either reinstall with a version that normalizes
+permissions, or repair it in place:
+
+```sh
+sudo chmod 755 /opt/myapp
+sudo find /opt/myapp -type d -exec chmod a+rx {} +
+sudo find /opt/myapp -type f -exec chmod a+rX {} +
+```
+
+Then refresh your shell's command cache (`hash -r` in zsh/bash) and try again.
 
 ## Notes
 

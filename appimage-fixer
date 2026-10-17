@@ -265,9 +265,22 @@ fi
 # Normalize ownership so a root-owned tree cannot be tampered with by users.
 run chown -R root:root -- "$INSTALL_DIR"
 
-# Make sure the entry point stays executable.
+# Normalize permissions. Some AppImages ship the squashfs root (occasionally
+# other entries too) with a restrictive mode such as 0700; `cp -a` preserves
+# that, after which no unprivileged user can traverse the install or start the
+# app ("zsh: permission denied"). An app installed under /opt is meant to be
+# usable by normal users, so make directories traversable and files
+# world-readable while preserving the executable bit. chrome-sandbox keeps its
+# setuid bit, which is (re)applied below.
+run find "$INSTALL_DIR" -type d -exec chmod a+rx {} +
+run find "$INSTALL_DIR" -type f -exec chmod a+rX {} +
+
+# The install directory itself must be traversable as well.
+run chmod 755 -- "$INSTALL_DIR"
+
+# Make sure the entry point is executable.
 if [ -e "$INSTALL_DIR/AppRun" ]; then
-    run chmod +x -- "$INSTALL_DIR/AppRun"
+    run chmod 755 -- "$INSTALL_DIR/AppRun"
 fi
 
 # ---------------------------------------------------------------------------
