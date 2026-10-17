@@ -94,10 +94,10 @@ sudo appimage-fixer --force ~/Downloads/Obsidian-1.6.0.AppImage
 | --- | --- |
 | `-n`, `--name NAME` | Application name used for the directory, launcher and uninstaller. |
 | `-d`, `--dest DIR` | Exact directory to unpack into (default `/opt/<name>`). |
-| `-b`, `--bin-dir DIR` | Where the launcher symlink goes (default `/usr/local/bin`). |
+| `-b`, `--bin-dir DIR` | Where the launcher script goes (default `/usr/local/bin`). |
 | `-u`, `--uninstall-dir DIR` | Where the per-install uninstaller is written (default `/usr/local/bin`). |
 | `--desktop` / `--desktop-dir DIR` | Also install a `.desktop` entry (default `/usr/share/applications`). |
-| `--no-symlink` | Skip the launcher symlink. |
+| `--no-launcher` | Do not create the launcher script (old alias: `--no-symlink`). |
 | `--no-uninstaller` | Skip generating an uninstall script. |
 | `-f`, `--force` | Replace an existing installation. |
 | `-k`, `--keep-temp` | Keep the temporary extraction directory (useful for debugging). |
@@ -116,7 +116,12 @@ sudo appimage-fixer --force ~/Downloads/Obsidian-1.6.0.AppImage
    `chrome-sandbox` found is fixed with `chown root:root` + `chmod 4755` (setuid
    root). It warns on a `nosuid` mount and verifies the resulting mode where
    possible.
-3. **Generates an uninstall script** for that specific installation at
+3. **Writes a launcher script** at `<bin-dir>/<name>`. It is deliberately *not*
+   a symlink to `AppRun`: an AppImage's `AppRun` usually expects the AppImage
+   runtime to have exported `$APPDIR`, and falls back to a broken guess when
+   run directly (see Troubleshooting). The launcher sets `APPDIR` and `ARGV0`
+   the way the runtime would, then execs `AppRun`.
+4. **Generates an uninstall script** for that specific installation at
    `<uninstall-dir>/uninstall-<name>`. It records the exact install directory,
    launcher and desktop file, so it removes precisely what was installed, then
    deletes itself. It is stored outside the install directory and re-executes
@@ -134,10 +139,10 @@ sudo /usr/local/bin/uninstall-obsidian
 
 **`zsh: permission denied: myapp`** right after installing.
 
-The launcher symlink is fine; the app directory (or something inside it) is not
-readable or executable by your user. This happens when the AppImage ships its
-squashfs root with a restrictive mode such as `0700`, which the installer used
-to preserve while unpacking. Check with:
+The launcher is fine; the app directory (or something inside it) is not readable
+or executable by your user. This happens when the AppImage ships its squashfs
+root with a restrictive mode such as `0700`, which the installer used to
+preserve while unpacking. Check with:
 
 ```sh
 ls -ld /opt/myapp
@@ -153,6 +158,36 @@ sudo find /opt/myapp -type f -exec chmod a+rX {} +
 ```
 
 Then refresh your shell's command cache (`hash -r` in zsh/bash) and try again.
+
+**`/usr/local/bin/myapp: line 45: /Myapp: No such file or directory`** (or similar
+`/<AppName>: No such file or directory`) when passing arguments, e.g.
+`myapp plugin ls`.
+
+This is a bug in the AppImage's own `AppRun`. `AppRun` normally expects the
+AppImage runtime to have exported `$APPDIR`; run standalone it guesses the
+AppDir by walking up from its own path looking for a directory that contains
+`"$1"`. With no arguments (`$1` empty) that guess happens to land on the right
+directory, which is why the app starts fine on its own; with a subcommand it
+walks all the way up, leaves `$APPDIR` empty, and ends up executing `/Myapp`.
+
+The installer avoids this by writing a launcher script that sets `APPDIR` (and
+`ARGV0`) before running `AppRun`, instead of symlinking to `AppRun` directly.
+If you installed an older version that created a plain symlink, either reinstall
+with `--force` or replace the launcher by hand:
+
+```sh
+sudo rm -f /usr/local/bin/myapp
+sudo tee /usr/local/bin/myapp >/dev/null <<'EOF'
+#!/usr/bin/env bash
+APPDIR=/opt/myapp
+export APPDIR
+exec "$APPDIR/AppRun" "$@"
+EOF
+sudo chmod 755 /usr/local/bin/myapp
+```
+
+`sudo rm -f` first is important: without it, `tee` would write *through* the
+existing symlink into `AppRun` itself.
 
 ## Notes
 
